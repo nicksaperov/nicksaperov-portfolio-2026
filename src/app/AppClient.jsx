@@ -109,6 +109,7 @@ function App() {
                 unsubscribeProjects = onSnapshot(collection(dbInstance, ...basePath, 'projects'), (snapshot) => {
                     const fetchedProjects = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     
+                    // STRATEGIC IMPLEMENTATION: Custom Priority Sorting
                     const projectOrder = [
                         'liquidity-evaporator',
                         'gcp-chrome-os',
@@ -122,9 +123,14 @@ function App() {
                     fetchedProjects.sort((a, b) => {
                         const indexA = projectOrder.indexOf(a.id);
                         const indexB = projectOrder.indexOf(b.id);
+                        
+                        // 1. Both items are in our priority list: sort by their exact position
                         if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+                        // 2. Only A is in the list: it automatically wins
                         if (indexA !== -1) return -1;
+                        // 3. Only B is in the list: it automatically wins
                         if (indexB !== -1) return 1;
+                        // 4. Neither are in the list: fallback to chronological (newest first)
                         const timeA = new Date(a.date || a.createdAt || a.timestamp || 0).getTime();
                         const timeB = new Date(b.date || b.createdAt || b.timestamp || 0).getTime();
                         return timeB - timeA; 
@@ -233,8 +239,24 @@ function App() {
         });
     };
 
-    const fetchGeminiWithRetry = async (text) => {
-        return "System Ping: LLM bypassed for pipeline diagnostics.";
+    const fetchGeminiWithRetry = async (text, retries = 5) => {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=`;
+        const systemPrompt = `You are the AI Assistant for Nick Saperov. Keep responses under 3 sentences. Language constraint: Reply in ${lang === 'en' ? 'English' : 'Russian'}. CRITICAL RULE: If the user asks for a proposal, mentions a PM role, requests a technical architecture audit, or shows high B2B intent, instantly stop answering and provide this exact link: 'Please ping Nick's direct Workspace terminal here: https://nicksaperov.xyz/connect'.`;
+        
+        const payload = { contents: [{ parts: [{ text: text }] }], systemInstruction: { parts: [{ text: systemPrompt }] } };
+        let delay = 1000;
+        
+        for (let i = 0; i < retries; i++) {
+            try {
+                const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (!response.ok) throw new Error(`HTTP error!`);
+                const data = await response.json();
+                return data.candidates?.[0]?.content?.parts?.[0]?.text || "Anomaly detected.";
+            } catch (err) {
+                if (i === retries - 1) return "System Error: Neural link severed.";
+                await new Promise(res => setTimeout(res, delay)); delay *= 2;
+            }
+        }
     };
 
     const handleSendMessage = async () => {
@@ -242,43 +264,37 @@ function App() {
         const userText = chatInput.trim(); setChatInput('');
         const newChatLog = [...chatLog, { role: 'user', text: userText }];
         setChatLog(newChatLog); setIsTyping(true);
+        setUserMessageCount(prev => prev + 1);
 
         const aiResponse = await fetchGeminiWithRetry(userText);
         setIsTyping(false); setChatLog([...newChatLog, { role: 'ai', text: aiResponse }]);
 
-        if (!leadCaptured) {
+        if (userMessageCount + 1 === 3 && !leadCaptured) {
             setTimeout(() => {
                 setIsLeadCaptureMode(true);
-                setChatLog(prev => [...prev, { role: 'system', text: lang === 'en' ? "SYSTEM ALERT: Please authenticate via Email or Telegram handle." : "СИСТЕМНОЕ УВЕДОМЛЕНИЕ: Пожалуйста, авторизуйтесь через Email." }]);
-            }, 500);
+                setChatLog(prev => [...prev, { role: 'system', text: lang === 'en' ? "SYSTEM ALERT: Please authenticate via Email or Telegram handle." : "СИСТЕМНОЕ УВЕДОМЛЕНИЕ: Пожалуйста, авторизуйтесь через Email или Telegram." }]);
+            }, 1500);
         }
     };
 
     const handleSubmitLead = async () => {
         if (!leadHandle.trim()) return;
         try {
-            const formattedChat = chatLog.map(msg => `${msg.role.toUpperCase()}: ${msg.text}`).join('\n');
-
-            if (dbInstance) {
+            if (dbInstance && authInstance?.currentUser) {
                 const { collection, addDoc, serverTimestamp } = await nativeImport('https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js');
-                
-                await addDoc(collection(dbInstance, 'leads'), {
-                    name: "AI Terminal Lead",
-                    email: leadHandle,
-                    message: formattedChat,
-                    timestamp: serverTimestamp()
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'nicksaperov-portfolio';
+                await addDoc(collection(dbInstance, 'artifacts', appId, 'public', 'data', 'leads'), {
+                    handle: leadHandle, language: lang, chatHistory: chatLog, timestamp: serverTimestamp(), userId: authInstance.currentUser.uid
                 });
-
-                if (authInstance?.currentUser) {
-                    const appId = typeof __app_id !== 'undefined' ? __app_id : 'nicksaperov-portfolio';
-                    await addDoc(collection(dbInstance, 'artifacts', appId, 'public', 'data', 'leads'), {
-                        handle: leadHandle, language: lang, chatHistory: chatLog, timestamp: serverTimestamp(), userId: authInstance.currentUser.uid
-                    });
-                }
             }
 
+            // ==========================================
+            // ARCHITECTURE SYNC: INGRESS WEBHOOK URL
+            // ==========================================
             const webAppUrl = "https://script.google.com/macros/s/AKfycbyIO6N_3hGpaqms--cuxZ3DbxqzPBcJHPh4ckDgu-AaNd2mmcYRJcwfbO6_e1h5oXwI/exec";
             
+            const formattedChat = chatLog.map(msg => `${msg.role.toUpperCase()}: ${msg.text}`).join('\n');
+
             await fetch(webAppUrl, {
                 method: 'POST',
                 mode: 'no-cors',
